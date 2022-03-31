@@ -36,6 +36,7 @@ import sun.jvmstat.monitor.VmIdentifier;
 import com.amazon.corretto.hotpatch.org.objectweb.asm.ClassReader;
 import com.amazon.corretto.hotpatch.org.objectweb.asm.ClassVisitor;
 import com.amazon.corretto.hotpatch.org.objectweb.asm.ClassWriter;
+import com.amazon.corretto.hotpatch.org.objectweb.asm.Label;
 import com.amazon.corretto.hotpatch.org.objectweb.asm.MethodVisitor;
 import com.amazon.corretto.hotpatch.org.objectweb.asm.Opcodes;
 
@@ -84,6 +85,13 @@ public class Log4jHotPatch {
             ClassReader cr = new ClassReader(classfileBuffer);
             cr.accept(cv, 0);
             return cw.toByteArray();
+          } else if (className != null && className.endsWith("org/springframework/beans/CachedIntrospectionResults")) {
+            log("Transforming " + className + " (" + loader + ")");
+            ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS);
+            MethodInstrumentorClassVisitor2 cv = new MethodInstrumentorClassVisitor2(api, cw);
+            ClassReader cr = new ClassReader(classfileBuffer);
+            cr.accept(cv, 0);
+            return cw.toByteArray();
           } else {
             return null;
           }
@@ -99,7 +107,8 @@ public class Log4jHotPatch {
 
       for (Class<?> c : inst.getAllLoadedClasses()) {
         String className = c.getName();
-        if (className.endsWith("org.apache.logging.log4j.core.lookup.JndiLookup")) {
+        if (className.endsWith("org.apache.logging.log4j.core.lookup.JndiLookup") ||
+            className.endsWith("org.springframework.beans.CachedIntrospectionResults")) {
           log("Patching " + c + " (" + c.getClassLoader() + ")");
           try {
             inst.retransformClasses(c);
@@ -161,6 +170,64 @@ public class Log4jHotPatch {
       mv.visitCode();
       mv.visitLdcInsn("Patched JndiLookup::lookup()");
       mv.visitInsn(ARETURN);
+    }
+  }
+
+  static class MethodInstrumentorClassVisitor2 extends ClassVisitor {
+    public MethodInstrumentorClassVisitor2(int api, ClassVisitor cv) {
+      super(api, cv);
+    }
+
+    @Override
+    public MethodVisitor visitMethod(int access, String name, String desc, String signature, String[] exceptions) {
+      MethodVisitor mv = cv.visitMethod(access, name, desc, signature, exceptions);
+      if ("<init>".equals(name)) {
+        log("Found CachedIntrospectionResults::<init>");
+        mv = new MethodInstrumentorMethodVisitor2(api, mv);
+      }
+      return mv;
+    }
+  }
+
+  static class MethodInstrumentorMethodVisitor2 extends MethodVisitor implements Opcodes {
+
+    public MethodInstrumentorMethodVisitor2(int api, MethodVisitor mv) {
+      super(api, mv);
+    }
+
+    private boolean classLoaderCompare = false;
+
+    @Override
+    public void visitCode() {
+      log("Entering CachedIntrospectionResults::<init>");
+      mv.visitCode();
+      mv.visitFieldInsn(GETSTATIC, "java/lang/System", "out", "Ljava/io/PrintStream;");
+      mv.visitLdcInsn("-> Calling CachedIntrospectionResults::<init>");
+      mv.visitMethodInsn(INVOKEVIRTUAL, "java/io/PrintStream", "println", "(Ljava/lang/String;)V", false);
+    }
+
+    @Override
+    public void visitLdcInsn(Object value) {
+      if (value instanceof String && "classLoader".equals(value)) {
+        classLoaderCompare = true;
+        log("Found ldc classLoader");
+      } else {
+        classLoaderCompare = false;
+      }
+      mv.visitLdcInsn(value);
+    }
+
+    @Override
+    public void visitJumpInsn(int opcode, Label label) {
+      log("Visiting JumpInsn " + opcode + " (classLoaderCompare==" + classLoaderCompare + ")");
+      if (classLoaderCompare == true && opcode == IFNE) {
+        log("Changing IFNE to GOTO");
+        mv.visitInsn(POP);
+        mv.visitJumpInsn(GOTO, label);
+      } else {
+        mv.visitJumpInsn(opcode, label);
+      }
+      classLoaderCompare = false;
     }
   }
 
