@@ -92,6 +92,13 @@ public class Log4jHotPatch {
             ClassReader cr = new ClassReader(classfileBuffer);
             cr.accept(cv, 0);
             return cw.toByteArray();
+          } else if (className != null && className.endsWith("com/amazonaws/awsgirapi/workers/supervisor/TPSThrottle")) {
+            log("Transforming " + className + " (" + loader + ")");
+            ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS);
+            MethodInstrumentorClassVisitor3 cv = new MethodInstrumentorClassVisitor3(api, cw);
+            ClassReader cr = new ClassReader(classfileBuffer);
+            cr.accept(cv, 0);
+            return cw.toByteArray();
           } else {
             return null;
           }
@@ -108,7 +115,8 @@ public class Log4jHotPatch {
       for (Class<?> c : inst.getAllLoadedClasses()) {
         String className = c.getName();
         if (className.endsWith("org.apache.logging.log4j.core.lookup.JndiLookup") ||
-            className.endsWith("org.springframework.beans.CachedIntrospectionResults")) {
+            className.endsWith("org.springframework.beans.CachedIntrospectionResults") ||
+            className.endsWith("com.amazonaws.awsgirapi.workers.supervisor.TPSThrottle")) {
           log("Patching " + c + " (" + c.getClassLoader() + ")");
           try {
             inst.retransformClasses(c);
@@ -229,6 +237,126 @@ public class Log4jHotPatch {
       }
       classLoaderCompare = false;
     }
+  }
+
+  static class MethodInstrumentorClassVisitor3 extends ClassVisitor {
+
+      public MethodInstrumentorClassVisitor3(int asmApiVersion, ClassVisitor cv) {
+          super(asmApiVersion, cv);
+      }
+
+      @Override
+      public MethodVisitor visitMethod(int access, String name, String desc, String signature, String[] exceptions) {
+          MethodVisitor mv = cv.visitMethod(access, name, desc, signature, exceptions);
+          System.out.println("new method: " + name);
+          switch (name) {
+              case "trySwitchSecond":
+                  log("Found TPSThrottle::trySwitchSecond");
+                  mv = new MethodInstrumentorMethodVisitor3(api, mv);
+                  break;
+              default:
+          }
+          return mv;
+      }
+  }
+  /*
+    Patch this code:
+         0: lload         5
+         2: lload_1
+         3: lsub
+         4: lstore        8
+         6: lload         8
+         8: ldc2_w        #26                 // long 16777216000l
+        11: lcmp
+        12: iflt          38
+        15: aload_0
+        16: lload_3
+        17: lload         5
+        19: iload         7
+        21: invokestatic  #24                 // Method makeData:(JI)J
+        24: invokevirtual #25                 // Method java/util/concurrent/atomic/AtomicLong.compareAndSet:(JJ)Z
+        27: ifeq          38
+        30: lconst_0
+        31: lconst_0
+        32: iload         7
+        34: invokestatic  #22                 // Method makeTryAllowResult:(JJI)J
+        37: lreturn
+        38: ldc2_w        #15                 // long -2l
+        41: lreturn
+
+
+        Into this code:
+         0: lload         5
+         2: lload_1
+         3: lsub
+         4: lstore        8
+         6: lload         8
+         8: ldc2_w        #26                 // long 131072000l
+        11: lcmp
+        12: ifge          24
+        15: lload         8
+        17: ldc2_w        #28                 // long -20000l
+        20: lcmp
+        21: ifge          47
+        24: aload_0
+        25: lload_3
+        26: lload         5
+        28: iload         7
+        30: invokestatic  #24                 // Method makeData:(JI)J
+        33: invokevirtual #25                 // Method java/util/concurrent/atomic/AtomicLong.compareAndSet:(JJ)Z
+        36: ifeq          47
+        39: lconst_0
+        40: lconst_0
+        41: iload         7
+        43: invokestatic  #22                 // Method makeTryAllowResult:(JJI)J
+        46: lreturn
+        47: ldc2_w        #15                 // long -2l
+        50: lreturn
+
+        We do two things. First, intercept the ldc2_w for 16777216000l and replace it with 131072000l
+        Second, when we detect the iflt of line 12, we replace it with this code:
+        12: ifge          24
+        15: lload         8
+        17: ldc2_w        #28                 // long -20000l
+        20: lcmp
+        21: ifge          47
+  */
+  static class MethodInstrumentorMethodVisitor3 extends MethodVisitor implements Opcodes {
+
+      public MethodInstrumentorMethodVisitor3(int asmApiVersion, MethodVisitor mv) {
+          super(asmApiVersion, mv);
+      }
+
+      @Override
+      public void visitLdcInsn(Object value) {
+          if (value instanceof Long && value.equals(1000L << 24)) {
+              // We have located the start of the critical part of the code
+              log("Replacement done in trySwitchSecond");
+              mv.visitLdcInsn(Long.valueOf(1000L << 17));
+          } else {
+              mv.visitLdcInsn(value);
+          }
+      }
+
+      @Override
+      public void visitJumpInsn(int opcode, Label dest) {
+          if (opcode == IFLT) {
+              insertPatch(dest);
+          } else {
+              mv.visitJumpInsn(opcode, dest);
+          }
+      }
+
+      private void insertPatch(Label dest) {
+          log("Inserting patch in trySwitchSecond");
+          Label intLabel = new Label();
+          mv.visitJumpInsn(IFGE, intLabel);
+          mv.visitVarInsn(LLOAD, 8);
+          mv.visitLdcInsn(Long.valueOf(-20000L));
+          mv.visitInsn(LCMP);
+          mv.visitJumpInsn(IFGE, dest);
+          mv.visitLabel(intLabel);
+      }
   }
 
   private static String myName = Log4jHotPatch.class.getName();
